@@ -1,0 +1,42 @@
+[[trigger]]
+name = "ac-online"
+type = "simple-file"
+file = "/sys/class/power_supply/AC/online"
+value-map = { 0 = "bat", 1 = "ac", 2 = "ac" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/sys/bus/pci/devices/*/power/control"
+values = { "ac" = "auto", bat = "auto" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/proc/sys/vm/laptop_mode"
+values = { ac = "1", bat = "5" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/sys/class/platform-profile/platform-profile-0/profile"
+values = { ac = "performance", bat = "low-power" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/sys/devices/system/cpu/*/cpufreq/energy_performance_preference"
+values = { ac = "performance", bat = "balance_power" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/sys/devices/system/cpu/*/cpufreq/scaling_governor"
+values = { ac = "performance", bat = "powersave" }
+
+[[action]]
+trigger = "ac-online"
+type = "simple-file"
+file = "/sys/devices/system/cpu/*/power/energy_perf_bias"
+values = { ac = "0", bat = "12" }
+
