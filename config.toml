@@ -13,7 +13,13 @@ values = { "ac" = "auto", bat = "auto" }
 [[action]]
 trigger = "ac-online"
 type = "simple-file"
-file = "/proc/sys/vm/laptop_mode"
+file = "/sys/bus/usb/devices/*/power/control"
+values = { "ac" = "auto", bat = "auto" }
+
+[[action]]
+trigger = "ac-online"
+type = "sysctl"
+ctl = "vm.laptop_mode"
 values = { ac = "1", bat = "5" }
 
 [[action]]

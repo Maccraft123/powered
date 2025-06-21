@@ -1,33 +1,36 @@
 use std::collections::HashMap;
 use std::fs;
-use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use glob::glob;
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
 use nix::unistd::geteuid;
-use nix::sys::inotify::{
-    AddWatchFlags,
-    Inotify,
-    InitFlags,
-    WatchDescriptor,
-};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 fn verbose() -> bool {
     VERBOSE.load(Ordering::SeqCst)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+macro_rules! vprintln {
+    ($($tt: tt)*) => {
+        if verbose() {
+            println!($($tt)*)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum TriggerKind {
     SimpleFile,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Trigger {
     name: String,
     #[serde(rename = "type")]
@@ -37,46 +40,73 @@ struct Trigger {
     map: HashMap<String, String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "type")]
-enum Action {
-    SimpleFile {
-        trigger: String,
-        file: String,
-        values: HashMap<String, String>,
-    },
+#[derive(Debug, Deserialize)]
+struct Action {
+    trigger: String,
+    values: HashMap<String, String>,
+    #[serde(flatten)]
+    inner: ActionInner,
 }
 
 impl Action {
     fn on_trigger(&self, t: &str, value: &str) -> Result<()> {
-        match self {
-            Action::SimpleFile { trigger, file, values } => {
-                if t != *trigger {
-                    return Ok(())
-                }
+        if t != self.trigger {
+            return Ok(());
+        }
 
-                if let Some(val) = values.get(value) {
-                    let mut iter: Result<Vec<_>, _> = glob(file)?.collect();
-                    for path in iter? {
-                        if verbose() {
-                            eprintln!("Writing {} to {}", val, path.display());
-                        }
-                        fs::write(path, val)
-                            .context("Failed to write to simple-file on trigger")?;
-                    }
-                } else {
-                    if verbose() {
-                        eprintln!("Didn't find value for key {}", value);
-                    }
-                }
-            },
+        if let Some(val) = self.values.get(value) {
+            self.inner.run(val)?;
+        } else {
+            vprintln!("Didn't find value for key {}", value);
         }
 
         Ok(())
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+enum ActionInner {
+    SimpleFile {
+        file: String,
+    },
+    Sysctl {
+        #[serde(rename = "ctl", deserialize_with = "ActionInner::de_sysctl")]
+        file: String,
+    },
+}
+
+impl ActionInner {
+    fn run(&self, val: &str) -> Result<()> {
+        match self {
+            ActionInner::SimpleFile { file } | ActionInner::Sysctl { file } => {
+                let mut iter: Result<Vec<_>, _> = glob(file)?.collect();
+                for path in iter? {
+                    vprintln!("Writing {} to {}", val, path.display());
+                    fs::write(path, val).context("Failed to write to simple-file on trigger")?;
+                }
+            },
+        }
+
+        Ok(())
+    }
+    fn de_sysctl<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let s = String::deserialize(d)?;
+
+        let path = s.split(".")
+            .fold(String::from("/proc/sys"), |path, seg| format!("{path}/{seg}"));
+
+        if Path::new(&path).exists() {
+            Ok(path)
+        } else {
+            use serde::de::Error;
+            let err = format!("No sysctl knob: '{s}'");
+            Err(D::Error::custom(err))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct Config {
     action: Vec<Action>,
     trigger: Vec<Trigger>,
