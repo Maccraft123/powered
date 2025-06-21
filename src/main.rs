@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use mio::unix::SourceFd;
+use std::os::fd::AsRawFd;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use glob::glob;
-use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
-use nix::unistd::geteuid;
-use serde::{Deserialize, Deserializer, Serialize};
+use mio::{Events, Interest, Poll, Token};
+use serde::{Deserialize, Deserializer};
+use udev::{Device, MonitorBuilder};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 fn verbose() -> bool {
@@ -25,19 +28,35 @@ macro_rules! vprintln {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum TriggerKind {
-    SimpleFile,
-}
-
-#[derive(Debug, Deserialize)]
 struct Trigger {
     name: String,
-    #[serde(rename = "type")]
-    kind: TriggerKind,
-    file: PathBuf,
+    device: String,
+    property: String,
     #[serde(rename = "value-map")]
     map: HashMap<String, String>,
+}
+
+impl Trigger {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn device(&self) -> &str {
+        &self.device
+    }
+    fn value<'me>(&'me self, d: &Device) -> Option<&'me str> {
+        assert_eq!(*d.devpath(), *self.device);
+        if let Some(raw) = d.property_value(&self.property) {
+            self.map
+                .get(str::from_utf8(raw.as_bytes()).unwrap())
+                .map(|x| x.as_str())
+        } else {
+            eprintln!(
+                "{}: Property '{}' not found in device '{}'",
+                self.name, self.property, self.device
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,12 +99,12 @@ impl ActionInner {
     fn run(&self, val: &str) -> Result<()> {
         match self {
             ActionInner::SimpleFile { file } | ActionInner::Sysctl { file } => {
-                let mut iter: Result<Vec<_>, _> = glob(file)?.collect();
+                let iter: Result<Vec<_>, _> = glob(file)?.collect();
                 for path in iter? {
                     vprintln!("Writing {} to {}", val, path.display());
                     fs::write(path, val).context("Failed to write to simple-file on trigger")?;
                 }
-            },
+            }
         }
 
         Ok(())
@@ -93,8 +112,9 @@ impl ActionInner {
     fn de_sysctl<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         let s = String::deserialize(d)?;
 
-        let path = s.split(".")
-            .fold(String::from("/proc/sys"), |path, seg| format!("{path}/{seg}"));
+        let path = s.split(".").fold(String::from("/proc/sys"), |path, seg| {
+            format!("{path}/{seg}")
+        });
 
         if Path::new(&path).exists() {
             Ok(path)
@@ -121,107 +141,69 @@ impl Config {
     }
 }
 
-struct TriggerHandler<'a> {
-    trigger: &'a Trigger,
-    last_access: Option<Instant>,
-    cached_val: Option<&'a String>,
-}
-
-impl<'a> TriggerHandler<'a> {
-    fn new<'b>(trigger: &'a Trigger, inotify: &'b Inotify) -> Result<(Self, WatchDescriptor)> {
-        let desc = inotify.add_watch(&trigger.file, AddWatchFlags::IN_ACCESS)?;
-
-        Ok((Self {
-            last_access: None,
-            trigger,
-            cached_val: None,
-        }, desc))
-    }
-    fn name(&self) -> &str {
-        &self.trigger.name
-    }
-    fn poll_and_name(&mut self) -> Result<(Option<&str>, &str)> {
-        if self.last_access.is_some_and(|instant| instant.elapsed() < Duration::from_millis(50)) {
-            return Ok((None, &self.trigger.name));
-        }
-
-        let raw = fs::read_to_string(&self.trigger.file)?;
-        self.last_access = Some(Instant::now());
-        let val = self.trigger.map.get(raw.trim());
-
-        if val.is_none() {
-            eprintln!("Warning: No value map for {} in trigger {}", raw, self.trigger.name);
-        }
-
-        if val != self.cached_val {
-            self.cached_val = val;
-            Ok((self.cached_val.map(|s| s.as_str()), &self.trigger.name))
-        } else {
-            Ok((None, &self.trigger.name))
-        }
-    }
-}
-
 #[derive(Debug, Clone, Parser)]
 struct Args {
+    /// Enable extra debug output
     #[arg(short, long)]
     verbose: bool,
+    /// Config file
     #[arg(short, long)]
     cfg: PathBuf,
+    /// Exit immediately after applying current profile
+    #[arg(short, long)]
+    oneshot: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     VERBOSE.store(args.verbose, Ordering::SeqCst);
 
-    println!("Got args: {:#?}", args);
+    vprintln!("Got args: {:#?}", args);
 
-    let cfg_str = fs::read_to_string(&args.cfg)
-        .context("Failed to read the config file")?;
-    let cfg: Config = toml::from_str(&cfg_str)
-        .context("Failed to deserialize the config file")?;
+    let cfg_str = fs::read_to_string(&args.cfg).context("Failed to read the config file")?;
+    let cfg: Config = toml::from_str(&cfg_str).context("Failed to deserialize the config file")?;
 
-    println!("Got config: {:#?}", cfg);
+    vprintln!("Got config: {:#?}", cfg);
 
-    let mut trigger_map = HashMap::new();
-
-    let inotify = Inotify::init(InitFlags::empty())
-        .context("Failed to initialize an inotify instance")?;
+    let mut trigger_map: HashMap<OsString, &Trigger> = HashMap::new();
     for trig in &cfg.trigger {
-        let (mut handler, watch) = TriggerHandler::new(trig, &inotify)?;
-        let (value, name) = handler.poll_and_name()?;
-
-        if let Some(val) = value {
-            if verbose() {
-                println!("Init trigger {:?} result: {:?}", name, value);
-            }
-            if let Err(e) = cfg.on_trigger(name, &val) {
-                eprintln!("{e:#}");
-            }
-        }
-
-        trigger_map.insert(watch, handler);
+        let device = trig.device().to_owned().into();
+        trigger_map.insert(device, trig);
     }
 
+    let mon = MonitorBuilder::new()?
+        .match_subsystem("power_supply")?
+        .listen()?;
+
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(1024);
+    poll.registry().register(
+        &mut SourceFd(&mon.as_raw_fd()),
+        Token(0),
+        Interest::READABLE | Interest::WRITABLE,
+    )?;
+
     loop {
-        let events = inotify.read_events().unwrap();
-        for ev in &events {
-            if verbose() {
-                println!("Processing event: {:#?}", ev);
+        poll.poll(&mut events, None)?;
+
+        for mio_event in &events {
+            if mio_event.token() != Token(0) || !mio_event.is_writable() {
+                continue;
             }
 
-            if let Some(handler) = trigger_map.get_mut(&ev.wd) {
-                let (value, name) = handler.poll_and_name()?;
-                if let Some(val) = value {
-                    if verbose() {
-                        println!("Trigger {:?} result: {:?}", name, value);
-                    }
-                    if let Err(e) = cfg.on_trigger(name, &val) {
-                        eprintln!("{e:#}");
+            for ev in mon.iter() {
+                if let Some(handler) = trigger_map.get_mut(ev.devpath()) {
+                    let name = handler.name().to_owned();
+                    vprintln!("Running trigger {:?}", &name);
+
+                    if let Some(val) = handler.value(&ev.device()) {
+                        vprintln!("Trigger value: {:?}", val);
+                        if let Err(e) = cfg.on_trigger(&name, val) {
+                            eprintln!("{e:#}");
+                        }
                     }
                 }
             }
         }
     }
-    Ok(())
 }

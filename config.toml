@@ -1,8 +1,8 @@
 [[trigger]]
 name = "ac-online"
-type = "simple-file"
-file = "/sys/class/power_supply/AC/online"
-value-map = { 0 = "bat", 1 = "ac", 2 = "ac" }
+device = "/devices/pci0000:00/0000:00:1f.0/PNP0C09:00/ACPI0003:00/power_supply/AC"
+property = "POWER_SUPPLY_ONLINE"
+value-map = { 0 = "bat", 1 = "ac" }
 
 [[action]]
 trigger = "ac-online"
@@ -45,4 +45,3 @@ trigger = "ac-online"
 type = "simple-file"
 file = "/sys/devices/system/cpu/*/power/energy_perf_bias"
 values = { ac = "0", bat = "12" }
-
